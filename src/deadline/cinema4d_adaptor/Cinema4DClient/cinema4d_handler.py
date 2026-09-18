@@ -378,9 +378,8 @@ class Cinema4DHandler:
             # and 32-bit TIFF; a measured no-op for 8/16-bit PNG, including
             # 8-bit multi-pass files alongside a float beauty). Tile renders
             # manage this flag in tile_rendering.setup/finalize_tile_render, so
-            # the handler must not touch it here; at float depth that path
-            # leaves the conversion in place, so tiled float output still
-            # shifts -- tracked separately.
+            # the handler must not touch it here; float tiles route through
+            # C4D's internal save with the bake disabled (same mechanism).
             disable_ocio_bake = (
                 not is_tile_render
                 and hasattr(c4d, "RDATA_BAKE_OCIO_VIEW_TRANSFORM_RENDER")
@@ -397,10 +396,18 @@ class Cinema4DHandler:
             finally:
                 if disable_ocio_bake:
                     rd[c4d.RDATA_BAKE_OCIO_VIEW_TRANSFORM_RENDER] = orig_bake_flag
-            self._raise_on_render_error(result)
-            # Post-render tile processing: OCIO bake, crop, save tile, restore paths
             if is_tile_render and tile_ctx is not None:
+                try:
+                    self._raise_on_render_error(result)
+                except Exception:
+                    # finalize will not run; restore the render state that
+                    # setup_tile_render mutated (paths, Save Image, bake flag)
+                    tile_rendering.restore_tile_render_state(self.render_data, rd, tile_ctx)
+                    raise
+                # Post-render tile processing: OCIO bake, crop, save tile, restore paths
                 tile_rendering.finalize_tile_render(bm, rd, tile_ctx, self.render_data, start_frame)
+            else:
+                self._raise_on_render_error(result)
 
         print("Finished Rendering")
 

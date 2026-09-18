@@ -1036,7 +1036,7 @@ class TestStartRenderFloatOcio:
     def test_16bit_output_does_not_trigger_float_workaround(
         self, mock_base_time: Mock, mock_bitmap: Mock, mock_render_document: Mock
     ):
-        """Non-float depth (16-bit) takes the else branch but must not touch the flag."""
+        """16-bit depth must not trigger the workaround (integer formats; C4D rejects 16-bit depth on EXR, so half EXR cannot reach this state)."""
         handler, rd = self._make_handler(format_depth=c4d.RDATA_FORMATDEPTH_16)
         mock_render_document.return_value = c4d.RENDERRESULT_OK
 
@@ -1084,6 +1084,25 @@ class TestStartRenderFloatOcio:
         assert self._bake_flag_set_calls(rd) == []
         mock_tile_rendering.setup_tile_render.assert_called_once()
         mock_tile_rendering.finalize_tile_render.assert_called_once()
+
+    @patch("deadline.cinema4d_adaptor.Cinema4DClient.cinema4d_handler.tile_rendering")
+    @patch("deadline.cinema4d_adaptor.Cinema4DClient.cinema4d_handler.c4d.documents.RenderDocument")
+    @patch("deadline.cinema4d_adaptor.Cinema4DClient.cinema4d_handler.c4d.BaseTime")
+    def test_failed_tile_render_restores_setup_state(
+        self, mock_base_time: Mock, mock_render_document: Mock, mock_tile_rendering: Mock
+    ):
+        """A failed tile render must restore setup state since finalize never runs."""
+        handler, _rd = self._make_handler()
+        mock_render_document.return_value = MagicMock()  # not RENDERRESULT_OK
+
+        with (
+            patch.object(handler, "_cache_text_if_needed", return_value=False),
+            pytest.raises(RuntimeError),
+        ):
+            handler.start_render({"frame": "5", "tile_action": "render"})
+
+        mock_tile_rendering.restore_tile_render_state.assert_called_once()
+        mock_tile_rendering.finalize_tile_render.assert_not_called()
 
 
 class TestSetFrameChunkRange:

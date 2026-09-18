@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,6 +35,12 @@ DEFAULT_FORMAT = FORMAT_MAP[c4d.FILTER_PNG]
 # versions but SetColorProfile does not accept them until 2025.2.
 # https://developers.maxon.net/docs/py/2025_2_0/misc/whatisnew.html
 C4D_VERSION_2025_2 = 2025200
+
+
+def _parse_start_frame(frame_value: Any) -> int:
+    """Extract the start frame from a CHUNK[INT] value like '5-5' or '5'."""
+    text = str(frame_value)
+    return int(text.split("-")[0]) if "-" in text else int(text)
 
 
 def get_format_info(format_id: int) -> tuple[str, int]:
@@ -120,6 +128,10 @@ class TileContext:
     orig_bake_flag: Any
     requires_baking: bool
     save_bits: int
+    internal_save_base: str = ""
+    orig_save_image: Any = None
+    full_w: int = 0
+    full_h: int = 0
 
 
 def setup_tile_render(
@@ -189,13 +201,50 @@ def setup_tile_render(
     _has_ocio_bake = hasattr(c4d, "RDATA_BAKE_OCIO_VIEW_TRANSFORM_RENDER") and hasattr(
         c4d.documents, "BakeOcioViewToBitmap"
     )
-    requires_baking = _has_ocio_bake and rd[c4d.RDATA_FORMATDEPTH] == c4d.RDATA_FORMATDEPTH_8
+    # NOTE: read the depth via the RenderData object, not the raw container --
+    # the container may lack the key and return 0, which equals FORMATDEPTH_8.
+    format_depth = render_data[c4d.RDATA_FORMATDEPTH]
+    requires_baking = _has_ocio_bake and format_depth == c4d.RDATA_FORMATDEPTH_8
     orig_bake_flag = None
     if requires_baking:
         orig_bake_flag = rd.GetBool(c4d.RDATA_BAKE_OCIO_VIEW_TRANSFORM_RENDER)
         rd[c4d.RDATA_BAKE_OCIO_VIEW_TRANSFORM_RENDER] = False
 
-    save_bits = determine_save_bits(rd[c4d.RDATA_FORMATDEPTH])
+    # 32-bit float tiles (issue #540): RenderDocument fills a caller-supplied
+    # bitmap with raw render-space data (no flag changes that), so saving the
+    # bitmap writes shifted colors. Instead, save through C4D's internal save
+    # with the render-time bake disabled -- the mechanism verified for non-tile
+    # float output -- by redirecting RDATA_PATH to a per-tile temp base;
+    # finalize_tile_render crops the tile from that file and deletes it.
+    internal_save_base = ""
+    orig_save_image = None
+    is_float_depth = _has_ocio_bake and format_depth == c4d.RDATA_FORMATDEPTH_32
+    # Only formats in FORMAT_MAP can be located again after the save; others
+    # keep the previous bitmap-save flow.
+    is_known_format = render_data[c4d.RDATA_FORMAT] in FORMAT_MAP
+    if is_float_depth and is_known_format and tile_output_path:
+        # Save into a private temp directory with a token-free name: keeps the
+        # temp file out of the customer output directory (and job-attachment
+        # sync), sidesteps C4D path tokens in the user's output path, and lets
+        # cleanup remove the whole directory (covering any extra files C4D
+        # writes, e.g. a separate alpha). The frame in the prefix keeps
+        # consecutive frames unambiguous.
+        frame = _parse_start_frame(data.get("frame", "0"))
+        temp_dir = tempfile.mkdtemp(prefix=f"c4dtile_{frame}_{tile_col}_{tile_row}_")
+        internal_save_base = os.path.join(temp_dir, "tile")
+        render_data[c4d.RDATA_PATH] = internal_save_base
+        # The internal save only fires when Save Image is enabled; the scene may
+        # have it off (the old bitmap save did not depend on it).
+        orig_save_image = render_data[c4d.RDATA_SAVEIMAGE]
+        render_data[c4d.RDATA_SAVEIMAGE] = True
+        orig_bake_flag = rd.GetBool(c4d.RDATA_BAKE_OCIO_VIEW_TRANSFORM_RENDER)
+        rd[c4d.RDATA_BAKE_OCIO_VIEW_TRANSFORM_RENDER] = False
+        print(
+            f"Tile ({tile_col}, {tile_row}): using internal save for 32-bit "
+            "float output (see issue #540)"
+        )
+
+    save_bits = determine_save_bits(format_depth)
 
     return TileContext(
         tile_col=tile_col,
@@ -209,7 +258,73 @@ def setup_tile_render(
         orig_bake_flag=orig_bake_flag,
         requires_baking=requires_baking,
         save_bits=save_bits,
+        internal_save_base=internal_save_base,
+        orig_save_image=orig_save_image,
+        full_w=full_w,
+        full_h=full_h,
     )
+
+
+def restore_tile_render_state(render_data: Any, rd: Any, ctx: TileContext) -> None:
+    """Restore render state mutated by setup_tile_render and remove temp files.
+
+    Idempotent; safe to call both from finalize_tile_render and from the
+    handler when a failed render means finalize never runs.
+    """
+    if ctx.orig_bake_flag is not None:
+        rd[c4d.RDATA_BAKE_OCIO_VIEW_TRANSFORM_RENDER] = ctx.orig_bake_flag
+    if ctx.tile_output_path:
+        render_data[c4d.RDATA_PATH] = ctx.tile_output_path
+    if ctx.tile_multipass_path:
+        render_data[c4d.RDATA_MULTIPASS_FILENAME] = ctx.tile_multipass_path
+    if ctx.internal_save_base:
+        if ctx.orig_save_image is not None:
+            render_data[c4d.RDATA_SAVEIMAGE] = ctx.orig_save_image
+        temp_dir = os.path.realpath(os.path.dirname(ctx.internal_save_base))
+        # only ever remove the private directory created by setup_tile_render
+        if temp_dir.startswith(os.path.realpath(tempfile.gettempdir())):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _crop_float_bitmap(source_bmp: Any, left: int, top: int, width: int, height: int) -> Any:
+    """Crop a region from a float bitmap, preserving 32-bit channel data.
+
+    GetClonePart downgrades bitmaps loaded from disk to 8-bit channels, so copy
+    rows explicitly in RGBf like the assembly path does.
+    """
+    color_mode, inc = determine_color_mode(source_bmp.GetBt())
+    out = c4d.bitmaps.BaseBitmap()
+    if out.Init(width, height, depth=source_bmp.GetBt()) != c4d.IMAGERESULT_OK:
+        raise RuntimeError("Failed to allocate tile crop bitmap")
+    row_buffer = bytearray(width * inc)
+    row_view = memoryview(row_buffer)
+    for py in range(height):
+        source_bmp.GetPixelCnt(left, top + py, width, row_view, inc, color_mode, c4d.PIXELCNT_0)
+        out.SetPixelCnt(0, py, width, row_view, inc, color_mode, c4d.PIXELCNT_0)
+    return out
+
+
+def _find_internal_save_file(ctx: TileContext, render_data: Any) -> str:
+    """Locate the file C4D's internal save wrote for this tile's region render.
+
+    The base is unique per tile (``..._c4dtile_<col>_<row>``) and the file is
+    deleted after use, so a prefix+extension match is unambiguous; newest mtime
+    wins if a stale file survived an earlier failure.
+    """
+    ext, _save_filter = get_format_info(render_data[c4d.RDATA_FORMAT])
+    base_dir = os.path.dirname(ctx.internal_save_base) or "."
+    prefix = os.path.basename(ctx.internal_save_base)
+    candidates = [
+        os.path.join(base_dir, fn)
+        for fn in os.listdir(base_dir)
+        if fn.startswith(prefix) and fn.lower().endswith(ext.lower())
+    ]
+    if not candidates:
+        raise RuntimeError(
+            f"Tile ({ctx.tile_col}, {ctx.tile_row}): internal save output not "
+            f"found under {ctx.internal_save_base}"
+        )
+    return max(candidates, key=os.path.getmtime)
 
 
 def finalize_tile_render(
@@ -239,7 +354,31 @@ def finalize_tile_render(
         if ctx.orig_bake_flag is not None:
             rd[c4d.RDATA_BAKE_OCIO_VIEW_TRANSFORM_RENDER] = ctx.orig_bake_flag
 
-    if c4d.GetC4DVersion() >= C4D_VERSION_2025_2:
+    try:
+        _finalize_tile_output(bm, ctx, render_data, frame)
+    finally:
+        # Restore mutated render state and remove the temp directory, even
+        # when locating/cropping/saving raises.
+        restore_tile_render_state(render_data, rd, ctx)
+
+
+def _finalize_tile_output(bm: Any, ctx: TileContext, render_data: Any, frame: int) -> None:
+    """Crop and save the tile (see finalize_tile_render)."""
+    internal_save_path = ""
+    if ctx.internal_save_base:
+        # 32-bit float tile: crop from the file C4D's internal save wrote
+        # (scene-linear, issue #540) instead of from the render bitmap.
+        internal_save_path = _find_internal_save_file(ctx, render_data)
+        bm = _load_tile_bitmap(internal_save_path, "beauty", is_multipass=False)
+        # Verified: C4D writes region renders into a full-resolution canvas
+        # (unrendered area black). Guard the assumption so a change in that
+        # behavior fails loudly instead of cropping garbage.
+        if bm.GetBw() != ctx.full_w or bm.GetBh() != ctx.full_h:
+            raise RuntimeError(
+                f"Tile ({ctx.tile_col}, {ctx.tile_row}): internal save file is "
+                f"{bm.GetBw()}x{bm.GetBh()}, expected full frame {ctx.full_w}x{ctx.full_h}"
+            )
+    elif c4d.GetC4DVersion() >= C4D_VERSION_2025_2:
         bm.SetColorProfile(c4d.bitmaps.ColorProfile(), c4d.COLORPROFILE_INDEX_DISPLAYSPACE)
         bm.SetColorProfile(c4d.bitmaps.ColorProfile(), c4d.COLORPROFILE_INDEX_VIEW_TRANSFORM)
     else:
@@ -247,9 +386,13 @@ def finalize_tile_render(
             f"Tile ({ctx.tile_col}, {ctx.tile_row}): Skipping OCIO color profile reset (pre-2025.2)"
         )
 
-    # Crop the tile region from the full bitmap using GetClonePart to preserve
-    # bit depth and float data (GetPixel/SetPixel truncates to 8-bit integers).
-    tile_bmp = bm.GetClonePart(ctx.region_left, ctx.region_top, ctx.tile_w, ctx.tile_h)
+    # Crop the tile region. For the internal-save file use an explicit float
+    # row copy (GetClonePart downgrades loaded bitmaps to 8-bit channels); for
+    # the in-memory render bitmap GetClonePart preserves bit depth.
+    if ctx.internal_save_base:
+        tile_bmp = _crop_float_bitmap(bm, ctx.region_left, ctx.region_top, ctx.tile_w, ctx.tile_h)
+    else:
+        tile_bmp = bm.GetClonePart(ctx.region_left, ctx.region_top, ctx.tile_w, ctx.tile_h)
 
     if tile_bmp is None:
         raise RuntimeError(
@@ -276,11 +419,11 @@ def finalize_tile_render(
         tile_bmp.Save(tile_path, tile_save_filter, c4d.BaseContainer(), ctx.save_bits)
         print(f"Saved tile ({ctx.tile_col}, {ctx.tile_row}) to {tile_path}")
 
-    # Restore output paths so subsequent tile renders can use them
-    if ctx.tile_output_path:
-        render_data[c4d.RDATA_PATH] = ctx.tile_output_path
-    if ctx.tile_multipass_path:
-        render_data[c4d.RDATA_MULTIPASS_FILENAME] = ctx.tile_multipass_path
+    if internal_save_path:
+        try:
+            os.remove(internal_save_path)
+        except OSError as exc:
+            print(f"WARNING: could not remove temp tile file {internal_save_path}: {exc}")
 
 
 def _load_tile_bitmap(tile_path: str, pass_label: str, is_multipass: bool) -> Any | None:
@@ -464,7 +607,7 @@ def assemble_tiles(
     # Task chunking and tile rendering are mutually exclusive (enforced in the submitter UI),
     # but the frame value still arrives in CHUNK[INT] contiguous range format (e.g. "1-1")
     # since the template always uses CHUNK[INT]. Extract the start frame from the range.
-    frame = int(data["frame"].split("-")[0]) if "-" in str(data["frame"]) else int(data["frame"])
+    frame = _parse_start_frame(data["frame"])
 
     output_path = data.get("output_path", "")
     multi_pass_path = data.get("multi_pass_path", "")
